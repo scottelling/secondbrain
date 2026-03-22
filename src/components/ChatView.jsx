@@ -56,21 +56,27 @@ function ChatView({ nodes, chatQueue, setChatQueue, chatMessages, setChatMessage
     setChatLoading(true);
 
     try {
-      const headers = { "Content-Type": "application/json" };
-      if (settings.apiKey) headers["x-api-key"] = settings.apiKey;
-
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
+      const response = await fetch("/api/chat", {
         method: "POST",
-        headers,
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: settings.aiModel || "claude-sonnet-4-6",
-          max_tokens: 1000,
-          system: "You are a helpful thinking partner embedded in an outliner app called Second Brain. Keep responses concise and actionable. Use short paragraphs, not bullet lists. The user may send you notes, ideas, tasks, or research items from their outliner for you to help with.",
           messages: newMessages.map((m) => ({ role: m.role, content: m.content })),
+          model: settings.aiModel || "claude-sonnet-4-6",
         }),
       });
 
       const data = await response.json();
+
+      if (!response.ok) {
+        const errMsg = response.status === 401
+          ? "Sign in to use AI Chat."
+          : response.status === 403
+          ? "Upgrade to Pro to use AI Chat."
+          : data.error || `Error: ${response.status}`;
+        setChatMessages((prev) => [...prev, { role: "assistant", content: errMsg }]);
+        return;
+      }
+
       const assistantText = data.content?.map((c) => c.text || "").join("") || "Sorry, I couldn't generate a response.";
       setChatMessages((prev) => [...prev, { role: "assistant", content: assistantText }]);
     } catch (err) {
