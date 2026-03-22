@@ -2228,6 +2228,7 @@ export default function SecondBrain() {
                   }}
                 >
                   <textarea
+                    data-outline-input
                     ref={(el) => {
                       inputRefs.current[node.id] = el;
                       // Auto-resize height to content

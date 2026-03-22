@@ -17,7 +17,7 @@
 
 input::placeholder, textarea::placeholder { color: #555; }
 textarea { display: block; }
-textarea:not(:focus) {
+textarea[data-outline-input]:not(:focus) {
   -webkit-user-select: none !important;
   user-select: none !important;
   -webkit-touch-callout: none !important;
