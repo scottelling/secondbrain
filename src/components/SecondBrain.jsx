@@ -4,6 +4,7 @@ import { uid, makeNode, NODE_TYPES, HIGHLIGHTS, PRIORITIES, PRI_COLORS, PRI_LABE
 import { findInTree, getNode, removeFromTree, insertAfterInTree, insertAsChild, insertBeforeInTree, updateText, toggleCollapse, updateNodeProp, flattenVisible, flattenAll, matchesFilter, getPrevVisible, getNextVisible, buildBreadcrumbs, getZoomedNodes, collectIds } from '../lib/tree';
 import { nodesToText, nodesToTextAll, toPlainText, toMarkdown, toJSON, toOPML } from '../lib/converters';
 import db from '../lib/db';
+import auth, { loadUserSettings, saveUserSettings, loadCustomThemes, saveCustomTheme, deleteCustomTheme } from '../lib/auth';
 import ChatView from './ChatView';
 import TimelineView from './TimelineView';
 import BoardColumn from './BoardColumn';
@@ -187,99 +188,109 @@ export default function SecondBrain() {
   }, []);
 
   // ─── Auth ───────────────────────────────────────────────
-  // Mock auth — swap these functions for Supabase auth calls
-  const auth = useMemo(() => ({
+  // Hydrate user data from Supabase after sign-in
+  const hydrateUser = useCallback(async (appUser) => {
+    setUser(appUser);
+    setAuthSheet(false);
+    setAuthForm({ email: "", password: "", name: "" });
+    // Migrate localStorage data if this is their first sign-in
+    await db.migrateLocalToSupabase(STORAGE_KEY);
+    // Load their data from Supabase
+    const data = await db.load(STORAGE_KEY);
+    if (data) {
+      if (data.nodes?.length) setNodes(data.nodes);
+      if (data.tabs?.length) {
+        setTabs(data.tabs);
+        setActiveTabIdx(data.activeTabIdx || 0);
+      }
+    }
+    // Load settings from user_settings table
+    const userSettings = await loadUserSettings(appUser.id);
+    if (userSettings) setSettings(prev => ({ ...prev, ...userSettings }));
+    // Load custom themes from custom_themes table
+    const themes = await loadCustomThemes(appUser.id);
+    if (themes.length) setCustomThemes(themes);
+  }, []);
+
+  // Auth action wrappers (call imported auth, then update component state)
+  const authActions = useMemo(() => ({
     signIn: async ({ email, password }) => {
-      // Production: const { data, error } = await supabase.auth.signInWithPassword({ email, password })
-      const mockUser = {
-        id: `user-${Date.now()}`,
-        name: email.split("@")[0],
-        email,
-        avatar: null,
-        plan: "pro",
-        provider: "email",
-        createdAt: new Date().toISOString(),
-      };
-      setUser(mockUser);
-      db.save(USER_KEY, mockUser);
-      setAuthSheet(false);
-      setAuthForm({ email: "", password: "", name: "" });
-      return { user: mockUser, error: null };
+      const { user: appUser, error } = await auth.signIn({ email, password });
+      if (error) { showToast(error); return { user: null, error }; }
+      if (appUser) await hydrateUser(appUser);
+      return { user: appUser, error: null };
     },
     signUp: async ({ email, password, name }) => {
-      // Production: const { data, error } = await supabase.auth.signUp({ email, password, options: { data: { name } } })
-      const mockUser = {
-        id: `user-${Date.now()}`,
-        name: name || email.split("@")[0],
-        email,
-        avatar: null,
-        plan: "free",
-        provider: "email",
-        createdAt: new Date().toISOString(),
-      };
-      setUser(mockUser);
-      db.save(USER_KEY, mockUser);
-      setAuthSheet(false);
-      setAuthForm({ email: "", password: "", name: "" });
-      return { user: mockUser, error: null };
+      const { user: appUser, error } = await auth.signUp({ email, password, name });
+      if (error) { showToast(error); return { user: null, error }; }
+      if (appUser) await hydrateUser(appUser);
+      return { user: appUser, error: null };
     },
     signInWithProvider: async (provider) => {
-      // Production: const { data, error } = await supabase.auth.signInWithOAuth({ provider })
-      const mockUser = {
-        id: `user-${Date.now()}`,
-        name: provider === "google" ? "Google User" : "Apple User",
-        email: `user@${provider}.com`,
-        avatar: null,
-        plan: "pro",
-        provider,
-        createdAt: new Date().toISOString(),
-      };
-      setUser(mockUser);
-      db.save(USER_KEY, mockUser);
-      setAuthSheet(false);
-      return { user: mockUser, error: null };
+      const { error } = await auth.signInWithProvider(provider);
+      if (error) { showToast(error); return { user: null, error }; }
+      // OAuth redirects — onAuthStateChange handles the return
+      return { user: null, error: null };
     },
     signOut: async () => {
-      // Production: await supabase.auth.signOut()
+      await auth.signOut();
       setUser(GUEST_USER);
-      db.remove(USER_KEY);
       setAuthSheet(false);
+      // Reload guest data from localStorage
+      const data = await db.load(STORAGE_KEY);
+      if (data) {
+        if (data.nodes?.length) setNodes(data.nodes);
+        if (data.settings) setSettings(prev => ({ ...prev, ...data.settings }));
+      }
     },
     updateProfile: async (updates) => {
-      // Production: await supabase.auth.updateUser({ data: updates })
-      setUser((prev) => {
-        const updated = { ...prev, ...updates };
-        db.save(USER_KEY, updated);
-        return updated;
-      });
+      setUser(prev => ({ ...prev, ...updates }));
+      if (user.id !== "guest") {
+        await auth.updateProfile(user.id, updates);
+      }
     },
-  }), []);
+  }), [hydrateUser, showToast, user.id]);
 
   const isLoggedIn = user.id !== "guest";
 
   // ─── Persistence ─────────────────────────────────────────
-  // Load on mount
+  // Load on mount — check Supabase session first, fall back to localStorage
   useEffect(() => {
-    // Load user session
-    db.load(USER_KEY).then((userData) => {
-      if (userData) setUser(userData);
-    });
-    // Load app data
-    db.load(STORAGE_KEY).then((data) => {
-      if (data) {
+    let mounted = true;
+    (async () => {
+      // Check for existing Supabase session
+      const sessionUser = await auth.getSession();
+      if (sessionUser && mounted) {
+        await hydrateUser(sessionUser);
+        setLoaded(true);
+        return;
+      }
+      // No session — load from localStorage (guest mode)
+      const data = await db.load(STORAGE_KEY);
+      if (data && mounted) {
         if (data.nodes?.length) setNodes(data.nodes);
         if (data.tabs?.length) {
           setTabs(data.tabs);
           setActiveTabIdx(data.activeTabIdx || 0);
         } else if (data.zoomStack) {
-          setTabs([{ id: "tab-0", label: "🧠", zoomStack: data.zoomStack }]);
+          setTabs([{ id: "tab-0", label: "\uD83E\uDDE0", zoomStack: data.zoomStack }]);
         }
         if (data.settings) setSettings((prev) => ({ ...prev, ...data.settings }));
         if (data.customThemes?.length) setCustomThemes(data.customThemes);
       }
-      setLoaded(true);
+      if (mounted) setLoaded(true);
+    })();
+    // Listen for auth state changes (OAuth redirect returns here)
+    const unsubscribe = auth.onAuthStateChange((appUser, event) => {
+      if (!mounted) return;
+      if (event === 'SIGNED_IN' && appUser.id !== 'guest') {
+        hydrateUser(appUser);
+      } else if (event === 'SIGNED_OUT') {
+        setUser(GUEST_USER);
+      }
     });
-  }, []);
+    return () => { mounted = false; unsubscribe(); };
+  }, [hydrateUser]);
 
   // ─── Derived state (before effects) ──────────────────────
   const isDragging = dragState !== null;
@@ -301,9 +312,16 @@ export default function SecondBrain() {
     if (!loaded) return;
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      db.save(STORAGE_KEY, { nodes, tabs, activeTabIdx, settings, customThemes });
+      if (user.id !== "guest") {
+        // Authenticated: save document data to Supabase, settings/themes to their own tables
+        db.save(STORAGE_KEY, { nodes, tabs, activeTabIdx });
+        saveUserSettings(user.id, settings);
+      } else {
+        // Guest: save everything to localStorage
+        db.save(STORAGE_KEY, { nodes, tabs, activeTabIdx, settings, customThemes });
+      }
     }, 500);
-  }, [nodes, tabs, activeTabIdx, settings, customThemes, loaded]);
+  }, [nodes, tabs, activeTabIdx, settings, customThemes, loaded, user.id]);
 
   // ─── Tree Mutation Helpers ───────────────────────────────
 
@@ -1157,12 +1175,12 @@ export default function SecondBrain() {
     });
   }, [customThemes]);
 
-  const saveCustomTheme = useCallback(() => {
+  const handleSaveCustomTheme = useCallback(async () => {
     if (!newThemeName.trim()) return;
-    const theme = {
+    const themeData = {
       id: `custom-${Date.now()}`,
       label: newThemeName.trim(),
-      emoji: newThemeEmoji || "🎨",
+      emoji: newThemeEmoji || "\uD83C\uDFA8",
       fontFamily: settings.fontFamily,
       fontSize: settings.fontSize,
       fontWeight: settings.fontWeight,
@@ -1172,21 +1190,32 @@ export default function SecondBrain() {
       textColor: settings.textColor,
       accentColor: settings.accentColor,
     };
-    setCustomThemes((prev) => [...prev, theme]);
-    setSettings((prev) => ({ ...prev, theme: theme.id }));
+    if (user.id !== "guest") {
+      const saved = await saveCustomTheme(user.id, themeData);
+      if (saved) {
+        setCustomThemes((prev) => [...prev, saved]);
+        setSettings((prev) => ({ ...prev, theme: saved.id }));
+      }
+    } else {
+      setCustomThemes((prev) => [...prev, themeData]);
+      setSettings((prev) => ({ ...prev, theme: themeData.id }));
+    }
     setSaveThemeSheet(false);
     setNewThemeName("");
-    setNewThemeEmoji("🎨");
-    showToast(`Theme "${theme.label}" saved`);
-  }, [newThemeName, newThemeEmoji, settings, showToast]);
+    setNewThemeEmoji("\uD83C\uDFA8");
+    showToast(`Theme "${themeData.label}" saved`);
+  }, [newThemeName, newThemeEmoji, settings, showToast, user.id]);
 
-  const deleteCustomTheme = useCallback((themeId) => {
+  const handleDeleteCustomTheme = useCallback(async (themeId) => {
     setCustomThemes((prev) => prev.filter((t) => t.id !== themeId));
+    if (user.id !== "guest") {
+      await deleteCustomTheme(user.id, themeId);
+    }
     if (settings.theme === themeId) {
       setSettings((prev) => ({ ...prev, theme: "custom" }));
     }
     showToast("Theme deleted");
-  }, [settings.theme, showToast]);
+  }, [settings.theme, showToast, user.id]);
 
   // ─── Cleanup drag listeners on unmount ──────────────────
   useEffect(() => {
@@ -2612,7 +2641,7 @@ export default function SecondBrain() {
                       }} />
                     </button>
                     <button
-                      onClick={() => deleteCustomTheme(theme.id)}
+                      onClick={() => handleDeleteCustomTheme(theme.id)}
                       style={{
                         position: "absolute", top: -6, right: -6,
                         width: 18, height: 18, borderRadius: 9,
@@ -3014,7 +3043,7 @@ export default function SecondBrain() {
                   <input
                     type="text"
                     value={user.name}
-                    onChange={(e) => auth.updateProfile({ name: e.target.value })}
+                    onChange={(e) => authActions.updateProfile({ name: e.target.value })}
                     style={{
                       width: "100%", padding: "10px 14px", borderRadius: T.radiusSm,
                       background: "rgba(255,255,255,0.05)", border: `1px solid ${T.border}`,
@@ -3037,7 +3066,7 @@ export default function SecondBrain() {
                 )}
 
                 <button
-                  onClick={() => { auth.signOut(); showToast("Signed out"); }}
+                  onClick={() => { authActions.signOut(); showToast("Signed out"); }}
                   style={{
                     width: "100%", padding: "12px", borderRadius: T.radiusSm,
                     background: "none", border: `1px solid ${T.border}`,
@@ -3058,7 +3087,7 @@ export default function SecondBrain() {
                 {/* OAuth buttons */}
                 <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
                   <button
-                    onClick={() => { auth.signInWithProvider("google"); showToast("Signed in with Google"); }}
+                    onClick={() => { authActions.signInWithProvider("google"); showToast("Signing in with Google..."); }}
                     style={{
                       display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
                       width: "100%", padding: "12px", borderRadius: T.radiusSm,
@@ -3070,7 +3099,7 @@ export default function SecondBrain() {
                     Continue with Google
                   </button>
                   <button
-                    onClick={() => { auth.signInWithProvider("apple"); showToast("Signed in with Apple"); }}
+                    onClick={() => { authActions.signInWithProvider("apple"); showToast("Signing in with Apple..."); }}
                     style={{
                       display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
                       width: "100%", padding: "12px", borderRadius: T.radiusSm,
@@ -3134,10 +3163,10 @@ export default function SecondBrain() {
                   onClick={() => {
                     if (!authForm.email || !authForm.password) { showToast("Fill in all fields"); return; }
                     if (authMode === "login") {
-                      auth.signIn({ email: authForm.email, password: authForm.password });
+                      authActions.signIn({ email: authForm.email, password: authForm.password });
                       showToast("Signed in");
                     } else {
-                      auth.signUp({ email: authForm.email, password: authForm.password, name: authForm.name });
+                      authActions.signUp({ email: authForm.email, password: authForm.password, name: authForm.name });
                       showToast("Account created");
                     }
                   }}
@@ -3229,7 +3258,7 @@ export default function SecondBrain() {
                 type="text"
                 value={newThemeName}
                 onChange={(e) => setNewThemeName(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); saveCustomTheme(); } }}
+                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); handleSaveCustomTheme(); } }}
                 placeholder="Theme name..."
                 autoFocus
                 style={{
@@ -3239,7 +3268,7 @@ export default function SecondBrain() {
                 }}
               />
               <button
-                onClick={saveCustomTheme}
+                onClick={handleSaveCustomTheme}
                 style={{
                   padding: "10px 16px", borderRadius: T.radiusSm,
                   background: settings.accentColor, border: "none", color: settings.bgColor,
